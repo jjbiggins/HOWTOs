@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Launch FreeBSD in QEMU on macOS with a persistent disk (and persistent UEFI vars on AArch64/x86_64 EDK2).
+# Note: not using `set -u` — with `set -u`, expanding an empty bash array with "${a[@]}"
+# errors ("unbound variable") on common macOS Bash 3.2.
+set -eo pipefail
+
+# This clone may live anywhere on disk; paths below are derived only from this script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+HOWTO_MD="${REPO_ROOT}/HOWTO.md"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  freebsd-vm [--gui] [run] [--] [extra qemu args...]
+  freebsd-vm [--gui] install [--iso PATH] [--] [extra qemu args...]
+  freebsd-vm help
+
+By default the guest uses your terminal (-nographic -serial mon:stdio); no Cocoa window.
+QEMU monitor: Ctrl-a then c (then Ctrl-a c again to return to serial).
+
+Environment (optional):
+  FREEBSD_QEMU_STATE_DIR   Directory for disk + UEFI vars (default: ~/VMs/freebsd)
+  FREEBSD_QEMU_DISK        Disk image path (default: $STATE_DIR/disk.qcow2)
+  FREEBSD_QEMU_VARS        Writable UEFI vars image (default: $STATE_DIR/edk2-vars.fd)
+  FREEBSD_QEMU_ISO         Install media path (for install subcommand if --iso omitted)
+  FREEBSD_QEMU_RAM         Memory in MB (default: 4096)
+  FREEBSD_QEMU_CPUS        vCPU count (default: 4)
+  FREEBSD_QEMU_SHARE       Host directory to expose as 9p "shared" (optional)
+  FREEBSD_QEMU_NETDEV      Space-separated extra QEMU netdev/device args (optional; replaces default user netdev)
+  FREEBSD_QEMU_GUI         If set to 1, open a macOS Cocoa window instead of using the terminal
+  FREEBSD_QEMU_SERIAL      If set to 1, force terminal mode (same as default; for scripts)
+
+Flags:
+  --gui                    Open QEMU in a Cocoa window (keyboard/mouse/display)
+  --create-disk [SIZE]     Create missing disk with qemu-img (default SIZE: 64G)
+  --iso PATH               Install media (install subcommand)
+
+EOF
+  printf 'Full walkthrough: %s\n' "${HOWTO_MD}"
+}
+
+die() {
+  echo "freebsd-vm: $*" >&2
+  exit 1
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+brew_prefix_qemu() {
+  if have_cmd brew; then
+    brew --prefix qemu 2>/dev/null && return 0
+  fi
+  for p in /opt/homebrew/opt/qemu /usr/local/opt/qemu; do
+    if [[ -d "$p" ]]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+qemu_share_dir() {
+  local prefix
+  prefix="$(brew_prefix_qemu)" || die "Could not find QEMU (install with: brew install qemu). Tried brew and /opt/homebrew/opt/qemu, /usr/local/opt/qemu."
+  local d="${prefix}/share/qemu"
+  [[ -d "$d" ]] || die "Missing QEMU firmware directory: ${d}"
+  echo "$d"
+}
+
+append_path() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) PATH="${dir}:${PATH}" ;;
+  esac
+}
+
+host_arch="$(uname -m)"
+STATE_DIR="${FREEBSD_QEMU_STATE_DIR:-${HOME}/VMs/freebsd}"
+DISK="${FREEBSD_QEMU_DISK:-${STATE_DIR}/disk.qcow2}"
+VARS="${FREEBSD_QEMU_VARS:-${STATE_DIR}/edk2-vars.fd}"
+RAM_MB="${FREEBSD_QEMU_RAM:-4096}"
+SMP="${FREEBSD_QEMU_CPUS:-4}"
+ISO="${FREEBSD_QEMU_ISO:-}"
+SHARE="${FREEBSD_QEMU_SHARE:-}"
+CREATE_DISK=0
+CREATE_DISK_SIZE="64G"
+GUI_FLAG=0
+PASSTHROUGH=()
+MODE="run"
+
+# Accept --gui anywhere on the command line (e.g. `freebsd-vm run --gui`).
+FILTERED=()
+for a in "$@"; do
+  if [[ "$a" == "--gui" ]]; then
+    GUI_FLAG=1
+  else
+    FILTERED+=("$a")
+  fi
+done
+set -- "${FILTERED[@]}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+    run|install)
+      MODE="$1"
+      shift
+      ;;
+    --create-disk)
+      CREATE_DISK=1
+      shift
+      if [[ $# -gt 0 && "$1" != -* && "$1" != install && "$1" != run && "$1" != help ]]; then
+        CREATE_DISK_SIZE="$1"
+        shift
+      fi
+      ;;
+    --iso)
+      shift
+      [[ $# -gt 0 ]] || die "--iso requires a path"
+      ISO="$1"
+      shift
+      ;;
+    --)
+      shift
+      PASSTHROUGH+=("$@")
+      break
+      ;;
+    *)
+      PASSTHROUGH+=("$1")
+      shift
+      ;;
+  esac
+done
+
+[[ "$MODE" == "install" ]] || MODE="run"
+
+# Default: terminal (no Cocoa). GUI if --gui or FREEBSD_QEMU_GUI=1.
+USE_GUI=0
+[[ "$GUI_FLAG" == 1 || "${FREEBSD_QEMU_GUI:-0}" == "1" ]] && USE_GUI=1
+# Explicit terminal for legacy scripts:
+[[ "${FREEBSD_QEMU_SERIAL:-}" == "1" ]] && USE_GUI=0
+
+if [[ "$MODE" == "install" && -z "$ISO" ]]; then
+  die "install requires install media. Set FREEBSD_QEMU_ISO or pass --iso PATH"
+fi
+
+if [[ "$MODE" == "install" && ! -f "$ISO" ]]; then
+  die "ISO not found: $ISO"
+fi
+
+mkdir -p "$STATE_DIR"
+
+if [[ ! -f "$DISK" ]]; then
+  if [[ "$CREATE_DISK" -eq 1 ]]; then
+    have_cmd qemu-img || die "qemu-img not found (install qemu)"
+    qemu-img create -f qcow2 "$DISK" "$CREATE_DISK_SIZE"
+  else
+    die "Disk image missing: ${DISK} (see ${HOWTO_MD}, or pass --create-disk [SIZE])"
+  fi
+fi
+
+QEMU_SHARE="$(qemu_share_dir)"
+append_path "$(brew_prefix_qemu)/bin"
+
+# Writable UEFI varstore: copy QEMU's template when present (older packages), otherwise
+# create a blank raw image (64 MiB) which EDK2 initializes on first boot — some Homebrew
+# QEMU builds ship code.fd without a matching *-vars.fd.
+ensure_uefi_vars() {
+  local template="$1" dest="$2"
+  [[ -f "$dest" ]] && return 0
+  if [[ -f "$template" ]]; then
+    cp "$template" "$dest"
+    return 0
+  fi
+  have_cmd qemu-img || die "Cannot create UEFI vars (no template at ${template}): qemu-img not found"
+  qemu-img create -f raw "$dest" 64M
+}
+
+extra_9p=()
+if [[ -n "$SHARE" ]]; then
+  [[ -d "$SHARE" ]] || die "FREEBSD_QEMU_SHARE is not a directory: $SHARE"
+  extra_9p=(
+    -fsdev "local,id=shared_dev,path=${SHARE},security_model=mapped-xattr"
+    -device "virtio-9p-pci,fsdev=shared_dev,mount_tag=shared"
+  )
+fi
+
+if [[ -n "${FREEBSD_QEMU_NETDEV:-}" ]]; then
+  # shellcheck disable=SC2206
+  NETDEV_ARGS=( ${FREEBSD_QEMU_NETDEV} )
+else
+  NETDEV_ARGS=(
+    -netdev user,id=net0,hostfwd=tcp::2222-:22
+    -device virtio-net-pci,netdev=net0
+  )
+fi
+
+if [[ "$host_arch" == "arm64" ]]; then
+  have_cmd qemu-system-aarch64 || die "qemu-system-aarch64 not found in PATH"
+  CODE="${QEMU_SHARE}/edk2-aarch64-code.fd"
+  TEMPLATE_VARS="${QEMU_SHARE}/edk2-aarch64-vars.fd"
+  [[ -f "$CODE" ]] || die "Missing ${CODE} (your QEMU build may use different filenames; check ${QEMU_SHARE})"
+  ensure_uefi_vars "$TEMPLATE_VARS" "$VARS"
+
+  scsi_cd=()
+  disk_bootindex=1
+  if [[ "$MODE" == "install" ]]; then
+    scsi_cd=(
+      -device virtio-scsi-pci,id=scsi0
+      -drive "file=${ISO},if=none,id=cd0,media=cdrom,readonly=on"
+      -device scsi-cd,drive=cd0,bootindex=1
+    )
+    disk_bootindex=2
+  fi
+
+  display_args=()
+  if [[ "$USE_GUI" == 1 ]]; then
+    # USB HID via XHCI: virtio-keyboard often does not deliver keys to the Cocoa UI on macOS hosts.
+    # full-grab=on routes keyboard events to the guest while the window is active.
+    display_args=(
+      -display cocoa,full-grab=on
+      -device virtio-gpu-pci
+      -device qemu-xhci,id=usbehci
+      -device usb-kbd
+      -device usb-tablet
+    )
+  else
+    display_args=( -nographic -serial mon:stdio )
+  fi
+
+  exec qemu-system-aarch64 \
+    -name freebsd-qemu \
+    -machine virt,highmem=on \
+    -accel hvf \
+    -cpu host \
+    -smp "${SMP}" \
+    -m "${RAM_MB}" \
+    -drive if=pflash,format=raw,readonly=on,file="${CODE}" \
+    -drive if=pflash,format=raw,file="${VARS}" \
+    "${scsi_cd[@]}" \
+    -drive "if=none,id=disk0,file=${DISK},format=qcow2" \
+    -device "virtio-blk-pci,drive=disk0,bootindex=${disk_bootindex}" \
+    "${NETDEV_ARGS[@]}" \
+    "${extra_9p[@]}" \
+    "${display_args[@]}" \
+    "${PASSTHROUGH[@]}"
+
+elif [[ "$host_arch" == "x86_64" ]]; then
+  have_cmd qemu-system-x86_64 || die "qemu-system-x86_64 not found in PATH"
+  CODE="${QEMU_SHARE}/edk2-x86_64-code.fd"
+  TEMPLATE_VARS="${QEMU_SHARE}/edk2-x86_64-vars.fd"
+  [[ -f "$CODE" ]] || die "Missing ${CODE} (check ${QEMU_SHARE})"
+  ensure_uefi_vars "$TEMPLATE_VARS" "$VARS"
+
+  cd_args=()
+  disk_bootindex=1
+  if [[ "$MODE" == "install" ]]; then
+    cd_args=( -drive "file=${ISO},if=none,id=cd0,media=cdrom,readonly=on" -device ide-cd,drive=cd0,bootindex=1 )
+    disk_bootindex=2
+  fi
+
+  display_args=()
+  if [[ "$USE_GUI" == 1 ]]; then
+    display_args=(
+      -display cocoa,full-grab=on
+      -vga virtio
+      -device qemu-xhci,id=usbehci
+      -device usb-kbd
+      -device usb-tablet
+    )
+  else
+    display_args=( -nographic -serial mon:stdio )
+  fi
+
+  exec qemu-system-x86_64 \
+    -name freebsd-qemu \
+    -machine q35,accel=tcg \
+    -cpu qemu64 \
+    -smp "${SMP}" \
+    -m "${RAM_MB}" \
+    -drive if=pflash,format=raw,readonly=on,file="${CODE}" \
+    -drive if=pflash,format=raw,file="${VARS}" \
+    "${cd_args[@]}" \
+    -drive "if=none,id=disk0,file=${DISK},format=qcow2" \
+    -device virtio-blk-pci,drive=disk0,bootindex="${disk_bootindex}" \
+    "${NETDEV_ARGS[@]}" \
+    "${extra_9p[@]}" \
+    "${display_args[@]}" \
+    "${PASSTHROUGH[@]}"
+else
+  die "Unsupported host architecture: ${host_arch} (expected arm64 or x86_64)"
+fi

@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Automate FreeBSD QEMU VM setup on macOS: Homebrew + QEMU (optional), state directory,
+# download official UFS qcow2 from FreeBSD mirrors, resize disk, optional install ISO.
+# Does not start the VM; run bin/freebsd-vm afterward.
+set -eo pipefail
+
+# Common Homebrew locations (login shells usually add these via shellenv).
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+HOWTO_MD="${REPO_ROOT}/HOWTO.md"
+LAUNCHER="${SCRIPT_DIR}/freebsd-vm"
+
+usage() {
+  cat <<'EOF'
+Usage: setup-freebsd-vm [options]
+
+Downloads the official FreeBSD VM disk image (UFS qcow2), prepares the state directory,
+and ensures QEMU is available via Homebrew. Intended for a fresh VM layout matching
+this project's HOWTO (default state dir ~/VMs/freebsd).
+
+Options:
+  --release VER      FreeBSD release (default: 14.4 or FREEBSD_SETUP_RELEASE)
+  --state-dir PATH   Directory for disk/vars/ISO (default: ~/VMs/freebsd or FREEBSD_QEMU_STATE_DIR)
+  --disk-size SIZE   qemu-img resize target (default: 64G or FREEBSD_SETUP_DISK_SIZE)
+  --mirror URL       Mirror root (default: https://ftp.freebsd.org/pub/FreeBSD or FREEBSD_MIRROR)
+  --with-iso         Also curl the RELEASE disc1.iso (for ./bin/freebsd-vm install)
+  --install-brew     If brew is missing, run the official Homebrew install script (NONINTERACTIVE=1; may prompt for sudo once)
+  --force            Replace existing disk.qcow2 (renames old file with a timestamp)
+  --dry-run          Print the plan, check tools and launcher, HTTP-probe URLs; no downloads, brew, or disk changes
+  -h, --help         This help
+
+Environment:
+  FREEBSD_SETUP_RELEASE, FREEBSD_QEMU_STATE_DIR, FREEBSD_SETUP_DISK_SIZE, FREEBSD_MIRROR
+
+After success (from repository root):
+  ./bin/freebsd-vm run              # terminal console
+  ./bin/freebsd-vm --gui run        # Cocoa window
+  ./bin/freebsd-vm install --iso …  # if you used --with-iso
+
+EOF
+  printf 'Documentation: %s\n' "${HOWTO_MD}"
+}
+
+die() {
+  echo "setup-freebsd-vm: $*" >&2
+  exit 1
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+brew_shellenv() {
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+    return 0
+  fi
+  if [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+    return 0
+  fi
+  return 1
+}
+
+ensure_curl_xz() {
+  have_cmd curl || die "curl is required"
+  have_cmd xz || die "xz is required (install Xcode CLT or: brew install xz)"
+}
+
+ensure_brew() {
+  if have_cmd brew; then
+    brew_shellenv || true
+    return 0
+  fi
+  if [[ "${INSTALL_BREW:-0}" != 1 ]]; then
+    die "Homebrew is not installed. Install from https://brew.sh/ or run with --install-brew"
+  fi
+  echo "Installing Homebrew (NONINTERACTIVE=1)..."
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    || die "Homebrew install failed"
+  brew_shellenv || die "brew not found after install (add brew to your PATH and retry)"
+}
+
+ensure_qemu() {
+  local need=0
+  have_cmd qemu-img || need=1
+  case "$(uname -m)" in
+    arm64) have_cmd qemu-system-aarch64 || need=1 ;;
+    x86_64) have_cmd qemu-system-x86_64 || need=1 ;;
+    *) die "Unsupported host: $(uname -m) (expected arm64 or x86_64)" ;;
+  esac
+  if [[ "$need" == 0 ]]; then
+    brew_shellenv || true
+    return 0
+  fi
+  ensure_brew
+  brew_shellenv || true
+  echo "Installing QEMU via Homebrew..."
+  brew install qemu
+  brew_shellenv || true
+  case "$(uname -m)" in
+    arm64) have_cmd qemu-system-aarch64 || die "qemu-system-aarch64 still not on PATH" ;;
+    x86_64) have_cmd qemu-system-x86_64 || die "qemu-system-x86_64 still not on PATH" ;;
+  esac
+}
+
+RELEASE="${FREEBSD_SETUP_RELEASE:-14.4}"
+STATE_DIR="${FREEBSD_QEMU_STATE_DIR:-${HOME}/VMs/freebsd}"
+DISK_SIZE="${FREEBSD_SETUP_DISK_SIZE:-64G}"
+MIRROR="${FREEBSD_MIRROR:-https://ftp.freebsd.org/pub/FreeBSD}"
+INSTALL_BREW=0
+WITH_ISO=0
+FORCE=0
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --release)
+      [[ $# -ge 2 ]] || die "--release needs a value"
+      RELEASE="$2"
+      shift 2
+      ;;
+    --state-dir)
+      [[ $# -ge 2 ]] || die "--state-dir needs a path"
+      STATE_DIR="$2"
+      shift 2
+      ;;
+    --disk-size)
+      [[ $# -ge 2 ]] || die "--disk-size needs a value (e.g. 64G)"
+      DISK_SIZE="$2"
+      shift 2
+      ;;
+    --mirror)
+      [[ $# -ge 2 ]] || die "--mirror needs a URL"
+      MIRROR="${2%/}"
+      shift 2
+      ;;
+    --with-iso)
+      WITH_ISO=1
+      shift
+      ;;
+    --install-brew)
+      INSTALL_BREW=1
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    *)
+      die "unknown option: $1 (try --help)"
+      ;;
+  esac
+done
+
+host_arch="$(uname -m)"
+case "$host_arch" in
+  arm64)
+    VM_BASENAME="FreeBSD-${RELEASE}-RELEASE-arm64-aarch64-ufs.qcow2"
+    VM_URL="${MIRROR}/releases/VM-IMAGES/${RELEASE}-RELEASE/aarch64/Latest/${VM_BASENAME}.xz"
+    ISO_BASENAME="FreeBSD-${RELEASE}-RELEASE-arm64-aarch64-disc1.iso"
+    ISO_URL="${MIRROR}/releases/arm64/aarch64/ISO-IMAGES/${RELEASE}/${ISO_BASENAME}"
+    ;;
+  x86_64)
+    VM_BASENAME="FreeBSD-${RELEASE}-RELEASE-amd64-ufs.qcow2"
+    VM_URL="${MIRROR}/releases/VM-IMAGES/${RELEASE}-RELEASE/amd64/Latest/${VM_BASENAME}.xz"
+    ISO_BASENAME="FreeBSD-${RELEASE}-RELEASE-amd64-disc1.iso"
+    ISO_URL="${MIRROR}/releases/amd64/amd64/ISO-IMAGES/${RELEASE}/${ISO_BASENAME}"
+    ;;
+  *)
+    die "Unsupported host architecture: ${host_arch}"
+    ;;
+esac
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  echo "=== setup-freebsd-vm --dry-run (no disk, brew, or download changes) ==="
+  echo "Host arch:     ${host_arch}"
+  echo "Release:       ${RELEASE}"
+  echo "State dir:     ${STATE_DIR}"
+  echo "Disk size:     ${DISK_SIZE}"
+  echo "Mirror:        ${MIRROR}"
+  echo "VM basename:   ${VM_BASENAME}"
+  echo "VM URL:        ${VM_URL}"
+  if [[ "$WITH_ISO" == 1 ]]; then
+    echo "ISO basename:  ${ISO_BASENAME}"
+    echo "ISO URL:       ${ISO_URL}"
+  fi
+  echo "Target disk:   ${STATE_DIR}/disk.qcow2"
+  echo "Launcher:      ${LAUNCHER}"
+  echo ""
+
+  [[ -f "$LAUNCHER" ]] || die "Launcher missing: ${LAUNCHER}"
+  [[ -x "$LAUNCHER" ]] || echo "Warning: launcher is not executable: ${LAUNCHER}"
+  echo "Launcher script: OK (present)"
+
+  have_cmd curl && echo "curl: OK" || die "curl missing"
+  have_cmd xz && echo "xz:   OK" || echo "xz:   MISSING (required for a real run)"
+
+  echo ""
+  echo "Homebrew / QEMU (read-only check):"
+  if have_cmd brew; then
+    echo "  brew: $(command -v brew)"
+    brew_shellenv || true
+  else
+    echo "  brew: not in PATH (--install-brew would be needed on a real run)"
+  fi
+  if have_cmd qemu-img; then
+    echo "  qemu-img: $(command -v qemu-img)"
+  else
+    echo "  qemu-img: MISSING (brew install qemu on a real run)"
+  fi
+  case "$host_arch" in
+    arm64)
+      if have_cmd qemu-system-aarch64; then
+        echo "  qemu-system-aarch64: $(command -v qemu-system-aarch64)"
+      else
+        echo "  qemu-system-aarch64: MISSING"
+      fi
+      ;;
+    x86_64)
+      if have_cmd qemu-system-x86_64; then
+        echo "  qemu-system-x86_64: $(command -v qemu-system-x86_64)"
+      else
+        echo "  qemu-system-x86_64: MISSING"
+      fi
+      ;;
+  esac
+
+  echo ""
+  echo "HTTP probe (expects 200):"
+  vm_code="$(curl -fsSIL -o /dev/null -w "%{http_code}" "$VM_URL" 2>/dev/null)" || vm_code="error"
+  echo "  VM image: HTTP ${vm_code}"
+  [[ "$vm_code" == "200" ]] || die "VM URL did not return HTTP 200 (got: ${vm_code})"
+  if [[ "$WITH_ISO" == 1 ]]; then
+    iso_code="$(curl -fsSIL -o /dev/null -w "%{http_code}" "$ISO_URL" 2>/dev/null)" || iso_code="error"
+    echo "  ISO:      HTTP ${iso_code}"
+    [[ "$iso_code" == "200" ]] || die "ISO URL did not return HTTP 200 (got: ${iso_code})"
+  fi
+
+  echo ""
+  if [[ -f "${STATE_DIR}/disk.qcow2" && "$FORCE" != 1 ]]; then
+    echo "Note: ${STATE_DIR}/disk.qcow2 already exists — a real run would abort without --force."
+  elif [[ -f "${STATE_DIR}/disk.qcow2" && "$FORCE" == 1 ]]; then
+    echo "Note: disk exists — a real run with --force would rename it before replacing."
+  else
+    echo "Note: no existing disk.qcow2 at target path — a real run would download and install."
+  fi
+  echo ""
+  echo "Documentation: ${HOWTO_MD}"
+  echo "Dry-run completed successfully."
+  exit 0
+fi
+
+ensure_curl_xz
+mkdir -p "$STATE_DIR"
+cd "$STATE_DIR"
+
+DISK="${STATE_DIR}/disk.qcow2"
+if [[ -f "$DISK" && "$FORCE" != 1 ]]; then
+  die "Refusing to overwrite ${DISK} (use --force to rename the old disk and replace)"
+fi
+
+if [[ -f "$DISK" && "$FORCE" == 1 ]]; then
+  bak="disk.qcow2.bak.$(date +%Y%m%d%H%M%S)"
+  echo "Renaming existing disk to ${bak}"
+  mv -f "$DISK" "${STATE_DIR}/${bak}"
+fi
+
+ensure_qemu
+
+echo "Downloading VM image:"
+echo "  ${VM_URL}"
+curl -fL --retry 5 --retry-delay 3 -o "${VM_BASENAME}.xz" "$VM_URL"
+echo "Decompressing ${VM_BASENAME}.xz (this can take several minutes)..."
+xz -d "${VM_BASENAME}.xz"
+[[ -f "$VM_BASENAME" ]] || die "Expected ${STATE_DIR}/${VM_BASENAME} after decompress"
+mv -f "$VM_BASENAME" "$DISK"
+echo "Resizing disk to ${DISK_SIZE}..."
+qemu-img resize "$DISK" "$DISK_SIZE"
+
+if [[ "$WITH_ISO" == 1 ]]; then
+  echo "Downloading install ISO:"
+  echo "  ${ISO_URL}"
+  curl -fL --retry 5 --retry-delay 3 -o "${STATE_DIR}/${ISO_BASENAME}" "$ISO_URL"
+fi
+
+# Fresh NVRAM on next boot (avoid stale EFI state from a previous disk)
+rm -f "${STATE_DIR}/edk2-vars.fd"
+
+echo ""
+echo "Setup finished."
+echo "  State directory: ${STATE_DIR}"
+echo "  Disk:            ${DISK}"
+[[ "$WITH_ISO" == 1 ]] && echo "  ISO:             ${STATE_DIR}/${ISO_BASENAME}"
+echo "  Documentation:   ${HOWTO_MD}"
+echo ""
+echo "Start the VM:"
+echo "  ${LAUNCHER} run"
+echo "  ${LAUNCHER} --gui run"
+if [[ "$WITH_ISO" == 1 ]]; then
+  echo "Reinstall from ISO:"
+  echo "  ${LAUNCHER} install --iso \"${STATE_DIR}/${ISO_BASENAME}\""
+fi
